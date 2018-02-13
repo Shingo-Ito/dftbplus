@@ -23,7 +23,7 @@ Added
 
 - Header for code prints release / git comit version information
 
-- Interface to Nogoya REMD routines
+- Interface to Nagoya REMD routines
 
 Changed
 -------
