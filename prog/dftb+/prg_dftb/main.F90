@@ -71,6 +71,7 @@ module main
   use mdcommon
   use mdintegrator
   use tempprofile
+  use elstatpot, only : TElStatPotentials
   implicit none
   private
 
@@ -235,11 +236,10 @@ contains
       end if
 
       call resetExternalPotentials(potential)
-      if (tEField) then
-        call setUpExternalElectricField(tTDEField, tPeriodic, EFieldStrength, EFieldVector,&
-            & EFieldOmega, EFieldPhase, neighborList, nNeighbor, iCellVec, img2CentCell, cellVec,&
-            & deltaT, iGeoStep, coord0Fold, coord, EField, potential%extAtom(:,1), absEField)
-      end if
+      call setUpExternalElectricField(tEField, tTDEField, tPeriodic, EFieldStrength,&
+          & EFieldVector, EFieldOmega, EFieldPhase, neighborList, nNeighbor, iCellVec,&
+          & img2CentCell, cellVec, deltaT, iGeoStep, coord0Fold, coord, EField,&
+          & potential%extAtom(:,1), absEField)
 
       call mergeExternalPotentials(orb, species, potential)
 
@@ -278,6 +278,11 @@ contains
             & tempElec, nEl, parallelKS, Ef, energy, eigen, filling, rhoPrim, Eband, TS, E0, iHam,&
             & xi, orbitalL, HSqrReal, SSqrReal, eigvecsReal, iRhoPrim, HSqrCplx, SSqrCplx,&
             & eigvecsCplx, rhoSqrReal)
+
+        ! need to move into writeBandOut and modify
+        if (env%mpi%tReplicaMaster) then
+          write(*,*)'Master of replica',env%mpi%myReplica,eigen
+        end if
 
         if (tWriteBandDat) then
           call writeBandOut(fdBand, bandOut, eigen, filling, kWeight)
@@ -412,7 +417,7 @@ contains
           derivs(:,:) = derivs + excitedDerivs
         end if
         call env%globalTimer%stopTimer(globalTimers%forceCalc)
-        
+
         if (tStress) then
           call env%globalTimer%startTimer(globalTimers%stressCalc)
           call getStress(env, sccCalc, tEField, nonSccDeriv, EField, rhoPrim, ERhoPrim, qOutput,&
@@ -440,6 +445,12 @@ contains
         if (tUseConvergedForces) then
           call env%abort()
         end if
+      end if
+
+      if (tSccCalc .and. allocated(esp) .and. (.not. (tGeoOpt .or. tMD) .or. &
+          & needsRestartWriting(tGeoOpt, tMd, iGeoStep, nGeoSteps, restartFreq))) then
+        call esp%evaluate(env, sccCalc, EField)
+        call writeEsp(esp, env, iGeoStep, nGeoSteps)
       end if
 
       if (tForces) then
@@ -626,7 +637,7 @@ contains
       end if
       call writeAutotestTag(fdAutotest, autotestTag, tPeriodic, cellVol, tMulliken, qOutput,&
           & derivs, chrgForces, excitedDerivs, tStress, totalStress, pDynMatrix,&
-          & energy%EMermin, extPressure, energy%EGibbs, coord0, tLocalise, localisation)
+          & energy%EMermin, extPressure, energy%EGibbs, coord0, tLocalise, localisation, esp)
     end if
     if (tWriteResultsTag) then
       call writeResultsTag(fdResultsTag, resultsTag, derivs, chrgForces, tStress, totalStress,&
@@ -1095,9 +1106,12 @@ contains
 
 
   !> Sets up electric external field
-  subroutine setUpExternalElectricField(tTimeDepEField, tPeriodic, EFieldStrength, EFieldVector,&
-      & EFieldOmega, EFieldPhase, neighborList, nNeighbor, iCellVec, img2CentCell, cellVec, deltaT,&
-      & iGeoStep, coord0Fold, coord, EField, extAtomPot, absEField)
+  subroutine setUpExternalElectricField(tEfield, tTimeDepEField, tPeriodic, EFieldStrength,&
+      & EFieldVector, EFieldOmega, EFieldPhase, neighborList, nNeighbor, iCellVec, img2CentCell,&
+      & cellVec, deltaT, iGeoStep, coord0Fold, coord, EField, extAtomPot, absEField)
+
+    !> Whether electric field should be considered at all
+    logical, intent(in) :: tEfield
 
     !> Is there an electric field that varies with geometry step during MD?
     logical, intent(in) :: tTimeDepEField
@@ -1158,6 +1172,13 @@ contains
     integer :: nAtom
     integer :: iAt1, iAt2, iNeigh
     character(lc) :: tmpStr
+
+    if (.not. tEField) then
+      EField(:) = 0.0_dp
+      absEField = 0.0_dp
+      extAtomPot(:) = 0.0_dp
+      return
+    end if
 
     nAtom = size(nNeighbor)
 
@@ -1535,7 +1556,7 @@ contains
     !> Number of electrons
     real(dp), intent(in) :: nEl(:)
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> Fermi level(s)
@@ -1686,7 +1707,7 @@ contains
     !> Eigensolver choice
     integer, intent(in) :: solver
 
-    !> K-points and spins to be handled
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> dense hamitonian matrix
@@ -1729,7 +1750,7 @@ contains
 
   #:if WITH_SCALAPACK
     ! Distribute all eigenvalues to all nodes via global summation
-    call mpifx_allreduceip(env%mpi%interGroupComm, eigen, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%interReplicaComm, eigen, MPI_SUM)
   #:endif
 
   end subroutine buildAndDiagDenseRealHam
@@ -1776,7 +1797,7 @@ contains
     !> Eigensolver choice
     integer, intent(in) :: solver
 
-    !> K-points and spins to be handled
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> dense hamitonian matrix
@@ -1819,7 +1840,7 @@ contains
     end do
 
   #:if WITH_SCALAPACK
-    call mpifx_allreduceip(env%mpi%interGroupComm, eigen, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%interReplicaComm, eigen, MPI_SUM)
   #:endif
 
   end subroutine buildAndDiagDenseCplxHam
@@ -1869,7 +1890,7 @@ contains
     !> Eigensolver choice
     integer, intent(in) :: solver
 
-    !> K-points and spins to be handled
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> eigenvalues
@@ -1935,7 +1956,7 @@ contains
     end do
 
   #:if WITH_SCALAPACK
-    call mpifx_allreduceip(env%mpi%interGroupComm, eigen, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%interReplicaComm, eigen, MPI_SUM)
   #:endif
 
   end subroutine buildAndDiagDensePauliHam
@@ -1969,7 +1990,7 @@ contains
     !> Atomic orbital information
     type(TOrbitals), intent(in) :: orb
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> eigenvectors
@@ -2017,7 +2038,7 @@ contains
 
   #:if WITH_SCALAPACK
     ! Add up and distribute density matrix contribution from each group
-    call mpifx_allreduceip(env%mpi%globalComm, rhoPrim, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%intraReplicaComm, rhoPrim, MPI_SUM)
   #:endif
 
   end subroutine getDensityFromRealEigvecs
@@ -2064,7 +2085,7 @@ contains
     !> Atomic orbital information
     type(TOrbitals), intent(in) :: orb
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> eigenvectors of the system
@@ -2108,7 +2129,7 @@ contains
 
   #:if WITH_SCALAPACK
     ! Add up and distribute density matrix contribution from each group
-    call mpifx_allreduceip(env%mpi%globalComm, rhoPrim, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%intraReplicaComm, rhoPrim, MPI_SUM)
   #:endif
 
   end subroutine getDensityFromCplxEigvecs
@@ -2171,7 +2192,7 @@ contains
     !> species of all atoms in the system
     integer, intent(in) :: species(:)
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> eigenvectors
@@ -2275,13 +2296,13 @@ contains
   #:if WITH_SCALAPACK
     call env%globalTimer%startTimer(globalTimers%denseToSparse)
     ! Add up and distribute contributions from each group
-    call mpifx_allreduceip(env%mpi%globalComm, rhoPrim, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%intraReplicaComm, rhoPrim, MPI_SUM)
     if (allocated(iRhoPrim)) then
-      call mpifx_allreduceip(env%mpi%globalComm, iRhoPrim, MPI_SUM)
+      call mpifx_allreduceip(env%mpi%intraReplicaComm, iRhoPrim, MPI_SUM)
     end if
-    call mpifx_allreduceip(env%mpi%globalComm, energy%atomLS, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%intraReplicaComm, energy%atomLS, MPI_SUM)
     if (tMulliken .and. tSpinOrbit .and. .not. tDualSpinOrbit) then
-      call mpifx_allreduceip(env%mpi%globalComm, orbitalL, MPI_SUM)
+      call mpifx_allreduceip(env%mpi%intraReplicaComm, orbitalL, MPI_SUM)
     end if
     call env%globalTimer%stopTimer(globalTimers%denseToSparse)
   #:endif
@@ -2463,7 +2484,6 @@ contains
     end if
 
   end subroutine getMullikenPopulation
-
 
   !> Calculates various energy contributions
   subroutine getEnergies(sccCalc, qOrb, q0, chargePerShell, species, tEField, tXlbomd,&
@@ -2763,8 +2783,8 @@ contains
         call mix(pChrgMixer, qInpRed, qDiffRed)
       #:if WITH_MPI
         ! Synchronise charges in order to avoid mixers that store a history drifting apart
-        call mpifx_allreduceip(env%mpi%globalComm, qInpRed, MPI_SUM)
-        qInpRed(:) = qInpRed / env%mpi%globalComm%size
+        call mpifx_allreduceip(env%mpi%intraReplicaComm, qInpRed, MPI_SUM)
+        qInpRed(:) = qInpRed / env%mpi%intraReplicaComm%size
       #:endif
         call expandCharges(qInpRed, orb, nIneqOrb, iEqOrbitals, qInput, qBlockIn, iEqBlockDftbu,&
             & species0, nUJ, iUJ, niUJ, qiBlockIn, iEqBlockDftbuLS)
@@ -3023,7 +3043,7 @@ contains
     !> excited state settings
     type(LinResp), intent(inout) :: lresp
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> SCC module internal variables
@@ -3396,7 +3416,7 @@ contains
     !> Sparse overlap
     real(dp), intent(in) :: over(:)
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     real(dp), intent(out) :: ERhoPrim(:)
@@ -3475,7 +3495,7 @@ contains
     !> Sparse overlap
     real(dp), intent(in) :: over(:)
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> Eigenvectors (NOTE: they will be rewritten with work data on exit!)
@@ -3583,7 +3603,7 @@ contains
 
   #:if WITH_SCALAPACK
     ! Add up and distribute energy weighted density matrix contribution from each group
-    call mpifx_allreduceip(env%mpi%globalComm, ERhoPrim, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%intraReplicaComm, ERhoPrim, MPI_SUM)
   #:endif
 
   end subroutine getEDensityMtxFromRealEigvecs
@@ -3637,7 +3657,7 @@ contains
     !> Sparse overlap
     real(dp), intent(in) :: over(:)
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     complex(dp), intent(inout) :: eigvecsCplx(:,:,:)
@@ -3742,7 +3762,7 @@ contains
 
   #:if WITH_SCALAPACK
     ! Add up and distribute energy weighted density matrix contribution from each group
-    call mpifx_allreduceip(env%mpi%globalComm, ERhoPrim, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%intraReplicaComm, ERhoPrim, MPI_SUM)
   #:endif
 
   end subroutine getEDensityMtxFromComplexEigvecs
@@ -3795,7 +3815,7 @@ contains
     !> Is the hamitonian real (no k-points/molecule/gamma point)?
     logical, intent(in) :: tRealHS
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> Eigenvectors
@@ -3833,7 +3853,7 @@ contains
 
   #:if WITH_SCALAPACK
     ! Add up and distribute energy weighted density matrix contribution from each group
-    call mpifx_allreduceip(env%mpi%globalComm, ERhoPrim, MPI_SUM)
+    call mpifx_allreduceip(env%mpi%intraReplicaComm, ERhoPrim, MPI_SUM)
   #:endif
 
   end subroutine getEDensityMtxFromPauliEigvecs
@@ -3962,15 +3982,15 @@ contains
         if (tXlbomd) then
           call error("XLBOMD does not work with external charges yet!")
         else
-          call sccCalc%addForceDc(env, derivs, species, neighborList%iNeighbor, img2CentCell,&
-              & coord, chrgForces)
+          call sccCalc%addForceDc(env, derivs, species, neighborList%iNeighbor, img2CentCell, &
+              & chrgForces)
         end if
       else if (tSccCalc) then
         if (tXlbomd) then
           call sccCalc%addForceDcXlbomd(env, species, orb, neighborList%iNeighbor, img2CentCell,&
-              & coord, qOutput, q0, derivs)
+              & qOutput, q0, derivs)
         else
-          call sccCalc%addForceDc(env, derivs, species, neighborList%iNeighbor, img2CentCell, coord)
+          call sccCalc%addForceDc(env, derivs, species, neighborList%iNeighbor, img2CentCell)
         end if
       end if
 
@@ -4110,7 +4130,7 @@ contains
             & skOverCont, coord, species, neighborList%iNeighbor, nNeighbor, img2CentCell,&
             & iSparseStart, orb, potential%intBlock, cellVol)
       end if
-      call sccCalc%addStressDc(totalStress, species, neighborList%iNeighbor, img2CentCell,coord)
+      call sccCalc%addStressDc(totalStress, env, species, neighborList%iNeighbor, img2CentCell)
     else
       if (tImHam) then
         call getBlockiStress(env, totalStress, nonSccDeriv, rhoPrim, iRhoPrim, ERhoPrim, skHamCont,&
@@ -4595,7 +4615,7 @@ contains
     !> label for each atomic chemical species
     character(*), intent(in) :: speciesName(:)
 
-    !> K-points and spins to process
+    !> K-points, spins and structure replicas to be handled
     type(TParallelKS), intent(in) :: parallelKS
 
     !> Localisation measure of single particle states

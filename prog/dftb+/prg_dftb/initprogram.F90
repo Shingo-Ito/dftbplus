@@ -72,11 +72,13 @@ module initprogram
   use mainio, only : receiveGeometryFromSocket
   use ipisocket
 #:endif
+  use elstatpot
   use pmlocalisation
   use energies
   use potentials
   use taggedoutput
   use formatout
+  use, intrinsic :: iso_fortran_env, only : output_unit
   implicit none
 
   !> Tagged output files (machine readable)
@@ -406,6 +408,9 @@ module initprogram
 
   !> Do we need Mulliken charges?
   logical :: tMulliken
+
+  !> Electrostatic potentials if requested
+  type(TElStatPotentials), allocatable :: esp
 
   !> Calculate localised orbitals?
   logical :: tLocalise
@@ -880,7 +885,7 @@ contains
     !> flag to check for first cycle through a loop
     logical :: tFirst
 
-    !> Nr. of Hamiltonians to diagonalise independently
+    !> Nr. of Hamiltonians to diagonalise independently for a structure at each k-point
     integer :: nIndepHam
 
     real(dp) :: rTmp
@@ -904,6 +909,9 @@ contains
 
     !> Is SCC cycle initialised
     type(TSccInp), allocatable :: sccInp
+
+    !> workspace
+    real(dp), allocatable :: r3Tmp(:,:,:)
 
     !> Used for indexing linear response
     integer :: homoLoc(1)
@@ -981,13 +989,28 @@ contains
       tRealHS = .false.
     end if
 
+    ! temporary change for testing purposes
+    if (input%ctrl%nReplicas > 1) then
+      allocate(r3Tmp(3,nAtom,input%ctrl%nReplicas))
+      r3Tmp = 0.0_dp
+      do ii = 1, input%ctrl%nReplicas
+        r3Tmp(:,:,ii) = input%geom%coords(:,:,1)
+        ! make small structure difference in images
+        r3Tmp(1,1,ii) = r3Tmp(1,1,ii) + 0.1_dp*(ii-1)
+      end do
+      call move_alloc(r3Tmp,input%geom%coords)
+      write(*,*)'Coords',input%geom%coords
+    elseif (input%ctrl%nReplicas < 0) then
+      call error("Nonsensical replica count")
+    end if
+
   #:if WITH_MPI
-    call env%initMpi(input%ctrl%parallelOpts%nGroup)
+    call env%initMpi(input%ctrl%parallelOpts%nGroup, input%ctrl%nReplicas)
   #:endif
   #:if WITH_SCALAPACK
     call initScalapack(input%ctrl%parallelOpts%blacsOpts, nAtom, nOrb, t2Component, env)
   #:endif
-    call TParallelKS_init(parallelKS, env, nKPoint, nIndepHam)
+    call TParallelKS_init(parallelKS, env, nKPoint, nIndepHam, size(input%geom%coords,dim=3))
 
     sccTol = input%ctrl%sccTol
     tShowFoldedCoord = input%ctrl%tShowFoldedCoord
@@ -1155,6 +1178,9 @@ contains
         sccInp%extCharges = input%ctrl%extChrg
         if (allocated(input%ctrl%extChrgBlurWidth)) then
           sccInp%blurWidths = input%ctrl%extChrgblurWidth
+          if (any(sccInp%blurWidths < 0.0_dp)) then
+            call error("Gaussian blur widths for charges may not be negative")
+          end if
         end if
       end if
       if (allocated(input%ctrl%chrgConstr)) then
@@ -1200,9 +1226,14 @@ contains
     end if
 
     ! Initial coordinates
+
     allocate(coord0(3, nAtom))
-    @:ASSERT(all(shape(coord0) == shape(input%geom%coords)))
-    coord0(:,:) = input%geom%coords(:,:)
+    @:ASSERT(all(shape(input%geom%coords) == [3,nAtom,parallelKS%nTotalReplicas]))
+    ! assume there is only one replica in this processor's group
+    @:ASSERT(all(parallelKS%localKS(3, :) == parallelKS%localKS(3, 1)))
+    write(*,*)'HERE ',env%mpi%myReplica,parallelKS%localKS(3, 1)
+    coord0(:,:) = input%geom%coords(:, :, env%mpi%myReplica+1)
+    write(*,*)env%mpi%myReplica,coord0(:,:)
     tCoordsChanged = .true.
 
     allocate(species0(nAtom))
@@ -1609,6 +1640,14 @@ contains
       tDipole = .true.
     else
       tDipole = .false.
+    end if
+
+    if (allocated(input%ctrl%elStatPotentialsInp)) then
+      if (.not.tSccCalc) then
+        call error("Electrostatic potentials only available for SCC calculations")
+      end if
+      allocate(esp)
+      call TElStatPotentials_init(esp, input%ctrl%elStatPotentialsInp, tEField .or. tExtChrg)
     end if
 
     tLocalise = input%ctrl%tLocalise
@@ -2080,13 +2119,14 @@ contains
     if (env%tGlobalMaster) then
       call initOutputFiles(env, tWriteAutotest, tWriteResultsTag, tWriteBandDat, tDerivs,&
           & tWriteDetailedOut, tMd, tGeoOpt, geoOutFile, fdAutotest, fdResultsTag, fdBand,&
-          & fdEigvec, fdHessian, fdDetailedOut, fdMd, fdCharges)
+          & fdEigvec, fdHessian, fdDetailedOut, fdMd, fdCharges, esp)
     end if
 
     call getDenseDescCommon(orb, nAtom, t2Component, denseDesc)
 
   #:if WITH_SCALAPACK
     associate (blacsOpts => input%ctrl%parallelOpts%blacsOpts)
+      ! need to update atom grid to cope with replicas:
       call getDenseDescBlacs(env, blacsOpts%blockSize, blacsOpts%blockSize, denseDesc)
     end associate
   #:endif
@@ -2213,7 +2253,10 @@ contains
         & env%blacs%orbitalGrid%nRow, env%blacs%orbitalGrid%nCol
     write(stdOut, "('BLACS atom grid size:', T30, I0, ' x ', I0)") &
         & env%blacs%atomGrid%nRow, env%blacs%atomGrid%nCol
-  #:endif  
+  #:endif
+
+    write(output_unit,*)'I am with replica',parallelKS%localKS(3, 1),' of ',&
+        & parallelKS%nTotalReplicas
 
     if (tRandomSeed) then
       write(stdOut, "(A,':',T30,I14)") "Chosen random seed", iSeed
@@ -2788,8 +2831,8 @@ contains
 
   !> Initialises (clears) output files.
   subroutine initOutputFiles(env, tWriteAutotest, tWriteResultsTag, tWriteBandDat, tDerivs,&
-      & tWriteDetailedOut, tMd, tGeoOpt, geoOutFile, fdAutotest, fdResultsTag, fdBand,&
-      & fdEigvec, fdHessian, fdDetailedOut, fdMd, fdChargeBin)
+      & tWriteDetailedOut, tMd, tGeoOpt, geoOutFile, fdAutotest, fdResultsTag, fdBand, fdEigvec,&
+      & fdHessian, fdDetailedOut, fdMd, fdChargeBin, esp)
 
     !> Environment
     type(TEnvironment), intent(inout) :: env
@@ -2842,6 +2885,9 @@ contains
     !> File descriptor for charge restart file
     integer, intent(out) :: fdChargeBin
 
+    !> Electrostatic potentials if requested
+    type(TElStatPotentials), allocatable, intent(inout) :: esp
+
     call initTaggedWriter()
     if (tWriteAutotest) then
       call initOutputFile(autotestTag, fdAutotest)
@@ -2869,6 +2915,9 @@ contains
       call clearFile(trim(geoOutFile) // ".xyz")
     end if
     fdChargeBin = getFileId()
+    if (allocated(esp)) then
+      call initOutputFile(esp%espOutFile, esp%fdEsp)
+    end if
 
   end subroutine initOutputFiles
 
